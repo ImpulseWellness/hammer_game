@@ -27,18 +27,21 @@ Affiliation: Impulse Wellness
 
 import sys
 import time
+import threading
 import numpy as np
 import pickle
-from PyQt5 import QtWidgets, QtCore
-from PyQt5.QtWidgets import (
+from PyQt6 import QtWidgets, QtCore
+from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QSlider,
     QVBoxLayout, QHBoxLayout, QGridLayout, QDialog, QLineEdit,
     QCheckBox, QTableWidget, QTableWidgetItem
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer
 
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+
+from emgeniussdk import EMGeniusClient
 
 
 class EMGHammerGame(QWidget):
@@ -59,8 +62,45 @@ class EMGHammerGame(QWidget):
 
     LEADERBOARD_FILE = "leaderboard.pkl"
 
+    def handle_emg_data(self, data):
+        emg_data = data.get("channels", [])
+        if not emg_data:
+            return
+
+        ch0 = emg_data[0]
+        if ch0 is None:
+            return
+
+        samples = np.asarray(ch0, dtype=float).reshape(-1)
+        self._append_emg_samples(samples)
+
+    def setup_emgeniusclient(self):
+        # SDK Stuff
+        self.emg_client = EMGeniusClient()
+        connected_devices = self.emg_client.get_connected_devices()
+        print("Connected devices:", connected_devices)
+
+        devices_data = connected_devices.get("data", {})
+        all_devices = devices_data.get("devices", [])
+        if not all_devices:
+            print("No EMGenius devices connected.")
+            return
+        
+        first_device = all_devices[0]
+        if first_device:
+            self.emg_client.subscribe_emg_websocket(first_device, self.handle_emg_data)
+            self.use_sim_emg = False
+            print(f"Connected to device: {first_device}")
+        else:
+            print("No valid device ID found.")
+
+
+
     def __init__(self):
         super().__init__()
+
+        # =================================================
+        self.setup_emgeniusclient()
 
         # ---------------- Game state ----------------
         self.state = "idle"
@@ -71,6 +111,8 @@ class EMGHammerGame(QWidget):
 
         self.buffer_len = int(self.BUFFER_SEC * self.FS)
         self.emg_buffer = np.zeros(self.buffer_len)
+        self.emg_lock = threading.Lock()
+        self.use_sim_emg = True
 
         # ---------------- UI ----------------
         self.init_ui()
@@ -104,7 +146,7 @@ class EMGHammerGame(QWidget):
         self.flash_label = QLabel("")
 
         for lbl in [self.try_label, self.score_label, self.time_label, self.flash_label]:
-            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lbl.setStyleSheet("color: white")
 
         self.score_label.setStyleSheet("color: #aaffaa; font-size: 32px")
@@ -115,7 +157,7 @@ class EMGHammerGame(QWidget):
         self.start_btn.setFixedHeight(60)
         self.start_btn.clicked.connect(self.on_start_pressed)
 
-        self.boost_slider = QSlider(Qt.Horizontal)
+        self.boost_slider = QSlider(Qt.Orientation.Horizontal)
         self.boost_slider.setMinimum(0)
         self.boost_slider.setMaximum(100)
         self.boost_slider.setValue(30)
@@ -186,15 +228,15 @@ class EMGHammerGame(QWidget):
             return
 
         # ---- EMG simulation ----
-        n = int(self.CHUNK_SEC * self.FS)
-        boost = self.boost_slider.value() / 100
-        x = 0.015 * np.random.randn(n) + boost * 0.4 * np.random.randn(n)
-
-        self.emg_buffer = np.roll(self.emg_buffer, -n)
-        self.emg_buffer[-n:] = x
+        if self.use_sim_emg:
+            n = int(self.CHUNK_SEC * self.FS)
+            boost = self.boost_slider.value() / 100
+            x = 0.015 * np.random.randn(n) + boost * 0.4 * np.random.randn(n)
+            self._append_emg_samples(x)
 
         win = int(self.RMS_WIN_SEC * self.FS)
-        rms = np.sqrt(np.mean(self.emg_buffer[-win:] ** 2))
+        with self.emg_lock:
+            rms = np.sqrt(np.mean(self.emg_buffer[-win:] ** 2))
 
         p = (rms - self.BASELINE_RMS) / (self.MAX_EXPECTED_RMS - self.BASELINE_RMS)
         p = np.clip(p, 0, 1)
@@ -204,6 +246,20 @@ class EMGHammerGame(QWidget):
 
         self.score_label.setText(f"SCORE: {score}   PEAK: {self.peak_this_try}")
         self.update_bar(p)
+
+    def _append_emg_samples(self, samples):
+        samples = np.asarray(samples, dtype=float).reshape(-1)
+        if samples.size == 0:
+            return
+
+        if samples.size >= self.buffer_len:
+            with self.emg_lock:
+                self.emg_buffer = samples[-self.buffer_len:].copy()
+            return
+
+        with self.emg_lock:
+            self.emg_buffer = np.roll(self.emg_buffer, -samples.size)
+            self.emg_buffer[-samples.size:] = samples
 
     def finish_attempt(self):
         self.state = "idle"
@@ -231,7 +287,7 @@ class EMGHammerGame(QWidget):
         best = max(self.try_scores)
         dialog = ContactDialog(best)
 
-        if dialog.exec_() == QDialog.Accepted:
+        if dialog.exec() == QDialog.DialogCode.Accepted:
             entry = dialog.get_entry(best)
             self.leaderboard.append(entry)
             self.save_leaderboard()
@@ -324,4 +380,4 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = EMGHammerGame()
     win.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
